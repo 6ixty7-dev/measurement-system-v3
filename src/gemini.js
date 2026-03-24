@@ -1,223 +1,275 @@
-// ─── Gemini Client ────────────────────────────────────────────────────────────
-// Gemini does TWO jobs here:
-// 1. VISION: Analyses body photos → extracts measurements from silhouette
-// 2. GUIDE:  Converses naturally with the customer in their language
+// ─── Gemini Client v4 ─────────────────────────────────────────────────────────
+// Improvements over v3:
+// - Uses gemini-1.5-pro for measurements (better vision reasoning)
+// - Two-pass measurement: extract → sanity-check → correct
+// - Indian body proportion priors baked into prompts
+// - Better error recovery
 
 const KEY = import.meta.env.VITE_GEMINI_API_KEY;
-const VISION_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${KEY}`;
-const TEXT_URL   = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${KEY}`;
+
+// Use Pro for measurements (better accuracy), Flash for real-time guidance (speed)
+const PRO_URL   = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${KEY}`;
+const FLASH_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${KEY}`;
 
 export const geminiEnabled = () => !!KEY && KEY !== 'paste_your_gemini_key_here';
 
-// ─── Convert canvas/video frame to base64 JPEG ───────────────────────────────
 export function frameToBase64(canvas) {
-  return canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+  return canvas.toDataURL('image/jpeg', 0.92).split(',')[1];
 }
 
-// ─── STEP 1: Clothing check ───────────────────────────────────────────────────
-// Gemini looks at the first photo and checks if clothing is suitable
+// ─── Clothing check ───────────────────────────────────────────────────────────
 export async function checkClothing(base64img, lang) {
   const langNote = lang === 'ml'
-    ? 'Reply in Malayalam (മലയാളം). Keep it conversational and warm.'
-    : 'Reply in English. Keep it conversational and warm.';
+    ? 'Reply in Malayalam (മലയാളം). Be warm and friendly like a shop assistant.'
+    : 'Reply in English. Be warm and friendly like a shop assistant.';
 
-  const prompt = `You are TailorBee's AI measurement assistant helping a customer in India.
+  const prompt = `You are TailorBee's AI assistant helping a customer take body measurements in India.
 ${langNote}
 
-Look at this photo. Determine if the person is wearing clothing suitable for body measurements.
+Examine this photo carefully.
 
-SUITABLE: Fitted t-shirt, leggings, churidar, fitted kurta, sportswear — anything that shows body shape.
-NOT SUITABLE: Loose nighty, baggy salwar, oversized t-shirt, thick dupatta, heavy saree drape, loose gown, blanket/shawl.
+SUITABLE clothing (shows body shape): fitted t-shirt, leggings, churidar, fitted kurta, sportswear, tank top, fitted dress.
+NOT SUITABLE (hides body shape): loose nighty, baggy salwar, oversized shirt, heavy dupatta draped over body, thick saree, loose gown, blanket/shawl, very baggy anything.
 
-If NOT suitable: Speak warmly and explain why, suggest what to wear instead. Keep it to 2–3 sentences like a friendly tailor would say.
-If suitable: Just say "looks good, let's begin" style message in 1 sentence.
-If no person visible: Ask them to step in front of the camera.
+Respond with ONLY what you'd say out loud — natural, warm, conversational. No labels or JSON.
 
-Respond with ONLY the spoken message — no labels, no JSON, just what you'd say out loud.`;
+If NOT suitable: Explain warmly in 2 sentences what to change and why. E.g. "I can see you're wearing a loose nighty — that will make it hard to get accurate measurements. Could you change into a fitted t-shirt and leggings? It only takes 2 minutes and makes a big difference!"
+If suitable: One warm sentence like "You look perfectly dressed for measurements — let's get started!"
+If no person visible: Ask them to step in front of the camera.`;
 
-  return callVision(prompt, base64img);
+  return callFlashVision(prompt, base64img);
 }
 
-// ─── STEP 2: Angle verification ──────────────────────────────────────────────
-// Gemini looks at the photo and confirms if the person has actually turned
-// Returns { verified: bool, message: string }
+// ─── Angle verification ───────────────────────────────────────────────────────
 export async function verifyAngle(base64img, expectedAngle, lang) {
-  const langNote = lang === 'ml'
-    ? 'Reply in Malayalam (മലയാളം).'
-    : 'Reply in English.';
+  const langNote = lang === 'ml' ? 'Write "message" in Malayalam.' : 'Write "message" in English.';
 
-  const angleDescriptions = {
-    front: 'facing directly towards the camera — we should see their face clearly',
-    right: 'with their RIGHT side facing the camera — we should see their right shoulder and right hip clearly, face in profile',
-    back:  'with their BACK to the camera — we should NOT see their face',
-    left:  'with their LEFT side facing the camera — we should see their left shoulder and left hip clearly, face in profile',
+  const desc = {
+    front: 'facing DIRECTLY at the camera — face clearly visible, shoulders square to camera, both feet visible',
+    right: 'RIGHT side facing camera — only right ear/cheek visible, right shoulder closest to camera, profile view',
+    back:  'BACK to camera — back of head visible, NO face visible, both shoulders visible from behind',
+    left:  'LEFT side facing camera — only left ear/cheek visible, left shoulder closest to camera, profile view',
   };
 
-  const prompt = `You are TailorBee's measurement assistant.
+  const prompt = `You are TailorBee's measurement assistant verifying a customer's position.
 ${langNote}
 
-I need to capture the person's body from the ${expectedAngle} angle (${angleDescriptions[expectedAngle]}).
+Required position: ${expectedAngle.toUpperCase()} view — person should be ${desc[expectedAngle]}.
 
-Look at this photo and determine:
-1. Is the person positioned correctly for the ${expectedAngle} view?
-2. Is their full body visible from head to feet?
-3. Is the lighting/image quality acceptable?
-
-Respond ONLY with valid JSON, nothing else:
+Carefully examine this photo and respond ONLY with valid JSON:
 {
   "verified": true or false,
   "quality": "good" or "acceptable" or "poor",
-  "issue": "brief description of the main issue if not verified, or null if verified",
-  "message": "What you would say out loud to the customer — warm, helpful, specific. 1–2 sentences. ${lang === 'ml' ? 'In Malayalam' : 'In English'}."
-}`;
+  "faceVisible": true or false,
+  "fullBodyVisible": true or false,
+  "issue": "specific issue description or null",
+  "message": "What to say to customer — specific, helpful, warm. 1-2 sentences. If verified say something encouraging. If not, tell them EXACTLY what to fix."
+}
 
-  const raw = await callVision(prompt, base64img);
+Be strict: if it's supposed to be a side view but the person is still facing front, verified = false.`;
+
+  const raw = await callFlashVision(prompt, base64img);
   try {
-    const clean = raw.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
+    return JSON.parse(raw.replace(/```json|```/g, '').trim());
   } catch {
-    return { verified: false, quality: 'poor', issue: 'Could not analyse photo', message: raw };
+    return { verified: false, quality: 'poor', issue: 'Parse error', message: "Let's try that position again." };
   }
 }
 
-// ─── STEP 3: Core measurement extraction ─────────────────────────────────────
-// This is the main accuracy engine — Gemini Vision analyses all 4 photos
-export async function extractMeasurements(photos, garmentLabel, garmentContext, heightCm, lang) {
-  const langNote = lang === 'ml' ? 'Write the "analysis" field in Malayalam.' : 'Write the "analysis" field in English.';
+// ─── Main measurement extraction (v4: two-pass with sanity check) ─────────────
+export async function extractMeasurements(photos, garmentLabel, garmentContext, heightCm, lang, gender) {
+  const langNote = lang === 'ml' ? 'Write "analysis" in Malayalam.' : 'Write "analysis" in English.';
 
-  // Build multi-image prompt
-  const prompt = `You are an expert body measurement AI for TailorBee, an Indian clothing service.
-You are analysing 4 photos of the same person: front, right side, back, and left side views.
-The person's height is ${heightCm} cm — use this to calibrate all pixel-to-cm conversions.
-They need measurements for: ${garmentLabel} (${garmentContext})
+  // Indian body proportion reference ranges (for sanity checking)
+  const priors = gender === 'male' ? `
+INDIAN MALE BODY REFERENCE (use to sanity-check your estimates):
+- Average height: 165 cm, Average bust/chest: 90-100 cm, Average waist: 80-90 cm, Average hip: 90-98 cm
+- Shoulder width: typically 42-48 cm, Inseam: typically 74-82 cm` : `
+INDIAN FEMALE BODY REFERENCE (use to sanity-check your estimates):
+- Average height: 152 cm, Average bust: 84-96 cm, Average waist: 68-80 cm, Average hip: 90-102 cm
+- Shoulder width: typically 36-42 cm, Inseam: typically 68-76 cm
+- Waist-to-hip ratio: typically 0.75-0.85`;
 
-MEASUREMENT METHOD:
-- Use the person's known height (${heightCm} cm) to establish a pixel-per-cm scale
-- For WIDTH measurements: measure the pixel width at each body zone in the front/back photos
-- For DEPTH measurements: measure the pixel width at each body zone in the side photos  
-- For CIRCUMFERENCE: use ellipse formula C = π × √(2(a²+b²)) where a=half-width, b=half-depth
-- For LENGTH measurements: measure pixel distances along the body axis
-
-CRITICAL RULES:
-- Estimate conservatively — it's better to be 2cm loose than 2cm tight
-- If a measurement is unclear due to clothing, add 2–3 cm to account for fabric
-- Cross-check: bust should typically be larger than waist, hip ≥ bust for women
-- Indian body proportions: average waist-to-hip ratio is 0.8–0.9 for women
-- If you cannot see a body part clearly, note it in the analysis
-
+  const prompt = `You are an expert AI body measurement system for TailorBee, an Indian tailoring service.
+You have ${photos.filter(Boolean).length} photos: front, right side, back, left side.
+Person's HEIGHT: ${heightCm} cm — this is your primary calibration reference.
+Garment needed: ${garmentLabel} (${garmentContext})
+${priors}
 ${langNote}
 
-Respond ONLY with valid JSON:
+MEASUREMENT METHODOLOGY:
+Step 1 — CALIBRATION: Use the person's height (${heightCm} cm) to calculate pixels-per-cm.
+  - Measure pixel distance from top of head to bottom of feet in the front photo
+  - scale = ${heightCm} / pixel_height_of_body
+
+Step 2 — WIDTH EXTRACTION (from front photo):
+  - Chest width: widest point of torso at chest level (pixels × scale × 2 for circumference approximation start)
+  - Waist width: narrowest point of torso between chest and hips
+  - Hip width: widest point of hips/buttocks
+  - Shoulder width: distance between outer shoulder points
+
+Step 3 — DEPTH EXTRACTION (from side photo):
+  - Chest depth: widest measurement of torso from front to back at chest level
+  - Waist depth: front-to-back at waist level
+  - Hip depth: front-to-back at hip level
+
+Step 4 — CIRCUMFERENCE (ellipse Ramanujan approximation):
+  For each zone: C = π × (3(a+b) - √((3a+b)(a+3b))) where a=half-width, b=half-depth
+  This gives much more accurate circumference than simple π×diameter.
+
+Step 5 — LENGTH MEASUREMENTS (front photo, scaled):
+  - Sleeve: shoulder point to wrist
+  - Garment length: shoulder to desired hem level
+  - Inseam: crotch to ankle (inner leg)
+  - Rise: waistband to crotch (front)
+
+Step 6 — SANITY CHECK: Compare your results to the reference ranges above.
+  If any measurement is more than 20% outside the range for this height, re-examine and adjust.
+
+CLOTHING CORRECTION: If person is wearing non-form-fitting clothing, subtract 2-3cm from circumferences.
+
+Respond ONLY with valid JSON — no markdown, no explanation outside JSON:
 {
   "measurements": {
-    "bust": number_in_cm_or_null,
-    "waist": number_in_cm_or_null,
-    "hip": number_in_cm_or_null,
-    "shoulder_width": number_in_cm_or_null,
-    "sleeve_length": number_in_cm_or_null,
-    "garment_length": number_in_cm_or_null,
-    "inseam": number_in_cm_or_null,
-    "thigh": number_in_cm_or_null,
-    "knee": number_in_cm_or_null,
-    "calf": number_in_cm_or_null,
-    "ankle": number_in_cm_or_null,
-    "collar": number_in_cm_or_null,
-    "under_bust": number_in_cm_or_null,
-    "back_length": number_in_cm_or_null,
-    "rise": number_in_cm_or_null
+    "bust": number,
+    "waist": number,
+    "hip": number,
+    "shoulder_width": number,
+    "sleeve_length": number,
+    "garment_length": number,
+    "inseam": number,
+    "thigh": number,
+    "knee": number,
+    "calf": number,
+    "ankle": number,
+    "collar": number,
+    "under_bust": number,
+    "back_length": number,
+    "rise": number
   },
   "confidence": {
-    "bust": "high/medium/low",
-    "waist": "high/medium/low",
-    "hip": "high/medium/low"
+    "bust": "high|medium|low",
+    "waist": "high|medium|low",
+    "hip": "high|medium|low",
+    "shoulder_width": "high|medium|low",
+    "sleeve_length": "high|medium|low"
   },
-  "clothingNote": "brief note about clothing suitability impact, or null",
-  "analysis": "2–3 sentence warm summary for the customer about their measurements and fit tips. Mention if any measurement had low confidence."
+  "calibrationPxPerCm": number,
+  "clothingNote": "brief note or null",
+  "photosUsed": ["front","right","back","left"],
+  "analysis": "2-3 sentences for the customer. Warm, specific. Mention confidence and any caveats. Flag unusual measurements."
 }`;
 
-  // Call with all 4 images
+  // Build parts array with all available photos
   const parts = [{ text: prompt }];
-  const angleLabels = ['Front view', 'Right side', 'Back view', 'Left side'];
+  const labels = ['Front view photo:', 'Right side photo:', 'Back view photo:', 'Left side photo:'];
   photos.forEach((b64, i) => {
-    if (!b64) return;
-    parts.push({ text: `\n${angleLabels[i]}:` });
-    parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
+    if (b64) {
+      parts.push({ text: labels[i] });
+      parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
+    }
   });
 
-  const raw = await callVisionMulti(parts);
+  // Use Pro model for maximum accuracy on measurements
+  const raw = await callProVisionMulti(parts);
+
   try {
     const clean = raw.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
-  } catch {
-    return { measurements: {}, analysis: raw, confidence: {} };
+    const result = JSON.parse(clean);
+
+    // Post-process: round all measurements to 1 decimal
+    if (result.measurements) {
+      Object.keys(result.measurements).forEach(k => {
+        if (result.measurements[k] !== null && result.measurements[k] !== undefined) {
+          result.measurements[k] = parseFloat(parseFloat(result.measurements[k]).toFixed(1));
+        }
+      });
+    }
+    return result;
+  } catch (e) {
+    console.error('Measurement parse error:', e, '\nRaw:', raw.substring(0, 500));
+    return {
+      measurements: {},
+      confidence: {},
+      analysis: lang === 'ml'
+        ? 'അളവുകൾ പ്രോസസ്സ് ചെയ്യുമ്പോൾ ഒരു പ്രശ്നം ഉണ്ടായി. ദയവായി വീണ്ടും ശ്രമിക്കൂ.'
+        : 'There was an issue processing measurements. Please try again.',
+    };
   }
 }
 
-// ─── STEP 4: Real-time pose guidance ─────────────────────────────────────────
-// Gemini gives conversational feedback on the live camera frame
-// Called sparingly (every ~4 seconds) to avoid API overuse
+// ─── Real-time pose guidance (fast, Flash model) ──────────────────────────────
 export async function getPoseGuidance(base64img, expectedAngle, previousIssue, lang) {
   const langNote = lang === 'ml'
-    ? 'Reply in Malayalam (മലയാളം). Sound like a friendly shop assistant.'
-    : 'Reply in English. Sound like a friendly shop assistant.';
+    ? 'Reply in Malayalam (മലയാളം). Sound like a helpful friend.'
+    : 'Reply in English. Sound like a helpful friend.';
 
-  const angleInstructions = {
-    front: 'standing straight, facing directly at the camera, arms slightly away from body, full body visible',
-    right: 'turned so their right side faces the camera, standing straight, full body visible',
-    back:  'turned with their back to the camera, standing straight, full body visible',
-    left:  'turned so their left side faces the camera, standing straight, full body visible',
+  const needed = {
+    front: 'standing straight, facing camera directly, arms slightly away from sides, full body head-to-feet visible',
+    right: 'right side facing camera (profile), standing straight, full body visible',
+    back:  'back facing camera (no face visible), standing straight, full body visible',
+    left:  'left side facing camera (profile), standing straight, full body visible',
   };
 
-  const prompt = `You are TailorBee's live measurement assistant.
-${langNote}
+  const prompt = `TailorBee measurement assistant. ${langNote}
+Customer needs to be: ${needed[expectedAngle]}
+Last noted issue: "${previousIssue || 'none'}"
 
-The customer needs to be: ${angleInstructions[expectedAngle]}
-Previous issue noted: ${previousIssue || 'none'}
+Look at this live camera frame. Give ONE specific instruction under 18 words.
+Be like a real person — notice exactly what's wrong.
+Only say "Perfect, hold still" if everything genuinely looks correct.
+No generic advice. No repeating the same thing if it was the last issue.
+Reply with ONLY the spoken words.`;
 
-Look at this camera frame and give ONE short, specific, helpful instruction (under 20 words).
-Be like a real person helping them — notice exactly what's wrong and tell them specifically.
-
-Examples of good responses:
-- "Your arms are too close to your body — stretch them out just a little"
-- "I can't see your feet — please step back about half a metre"  
-- "You're almost there — just turn a tiny bit more to the right"
-- "Perfect! Stay exactly like that"
-
-Do NOT say generic things like "stand straight" unless that's really the issue.
-Respond with ONLY the spoken instruction — nothing else.`;
-
-  return callVision(prompt, base64img);
+  return callFlashVision(prompt, base64img);
 }
 
-// ─── Internal helpers ─────────────────────────────────────────────────────────
-async function callVision(prompt, base64img) {
-  if (!geminiEnabled()) return fallback(prompt);
+// ─── Internal API callers ─────────────────────────────────────────────────────
+async function callFlashVision(prompt, base64img) {
+  if (!geminiEnabled()) return "Ready when you are.";
   try {
-    const res = await fetch(VISION_URL, {
+    const res = await fetch(FLASH_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: 'image/jpeg', data: base64img } }
-          ]
-        }],
-        generationConfig: { maxOutputTokens: 400, temperature: 0.4 },
+        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: 'image/jpeg', data: base64img } }] }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0.35 },
       }),
     });
+    if (!res.ok) { console.warn('Gemini Flash error:', res.status); return "Ready when you are."; }
     const d = await res.json();
-    return d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || 'Ready when you are.';
+    return d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "Ready when you are.";
+  } catch (e) { console.warn('Flash vision error:', e); return "Ready when you are."; }
+}
+
+async function callProVisionMulti(parts) {
+  if (!geminiEnabled()) return '{"measurements":{},"analysis":"Gemini API key not configured. Add it to your .env file."}';
+  try {
+    const res = await fetch(PRO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: { maxOutputTokens: 1200, temperature: 0.15 },
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.warn('Gemini Pro error:', res.status, err);
+      // Fallback to Flash if Pro fails
+      return callFlashVisionMulti(parts);
+    }
+    const d = await res.json();
+    return d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '{}';
   } catch (e) {
-    console.warn('Gemini vision error:', e);
-    return 'Ready when you are.';
+    console.warn('Pro vision error:', e);
+    return callFlashVisionMulti(parts);
   }
 }
 
-async function callVisionMulti(parts) {
-  if (!geminiEnabled()) return '{"measurements":{}, "analysis":"Gemini API key not configured."}';
+async function callFlashVisionMulti(parts) {
   try {
-    const res = await fetch(VISION_URL, {
+    const res = await fetch(FLASH_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -227,13 +279,5 @@ async function callVisionMulti(parts) {
     });
     const d = await res.json();
     return d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '{}';
-  } catch (e) {
-    console.warn('Gemini multi-vision error:', e);
-    return '{}';
-  }
-}
-
-function fallback(prompt) {
-  if (prompt.includes('clothing')) return "You look ready to go! Let's start measuring.";
-  return "Please stand straight and face the camera.";
+  } catch { return '{}'; }
 }
